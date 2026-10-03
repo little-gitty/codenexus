@@ -298,6 +298,8 @@ function Dashboard({ user, onSignOut }) {
         ...prev,
         patchedCode: `// ❌ Patch generation failed\n// Error: ${err.message}\n// Please check your backend is running at ${BACKEND_URL}`,
         explanation: `Error: ${err.message}. Check that backend is online and retry.`,
+        graphStatus: prev.graphStatus === 'analyzing' ? 'error' : prev.graphStatus,
+        graphMessage: prev.graphStatus === 'analyzing' ? 'AST unavailable because the patch request failed.' : prev.graphMessage,
       }));
       setShowDiff(true); // show the error state in the panel
     }
