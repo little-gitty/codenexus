@@ -1,42 +1,50 @@
-import { Mistral } from '@mistralai/mistralai';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const apiKey = process.env.MISTRAL_API_KEY;
-const client = apiKey ? new Mistral({ apiKey }) : null;
+const apiKey = process.env.GROQ_API_KEY;
+const model = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 
 export async function generateCodePatch(brokenCode, errorMessage) {
-  if (!client) {
-    console.warn('⚠️ MISTRAL_API_KEY not found in .env. Returning simulated patch.');
-    return {
-      code: `// OrderController.js - Safe Fallback Patch\nfunction calculateTotal(order) {\n  const price = order?.item?.price || 0;\n  return price * (order?.quantity || 0);\n}`,
-      tokens: { prompt: 120, completion: 85, total: 205 },
-    };
+  if (!apiKey) {
+    throw new Error('GROQ_API_KEY is not configured.');
   }
 
   try {
     const prompt = `You are an automated code repair agent. Fix this broken JavaScript code.\n\nError: ${errorMessage}\n\nBroken Code:\n${brokenCode}\n\nReturn ONLY the corrected, executable JavaScript code. Do not include markdown formatting or extra explanations.`;
 
-    const response = await client.chat.complete({
-      model: 'codestral-latest',
-      messages: [{ role: 'user', content: prompt }]
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2
+      })
     });
 
-    const patch = response.choices[0].message.content;
-    const cleanedCode = patch.replace(/```javascript/g, '').replace(/```/g, '').trim();
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error?.message || 'Groq API request failed.');
+    }
+
+    const patch = data?.choices?.[0]?.message?.content || '';
+    const cleanedCode = patch.replace(/```(?:javascript)?/gi, '').replace(/```/g, '').trim();
 
     // Extract token usage from response
-    const tokens = response.usage
+    const tokens = data.usage
       ? {
-          prompt: response.usage.promptTokens || response.usage.prompt_tokens || 0,
-          completion: response.usage.completionTokens || response.usage.completion_tokens || 0,
-          total: response.usage.totalTokens || response.usage.total_tokens || 0,
+          prompt: data.usage.prompt_tokens || 0,
+          completion: data.usage.completion_tokens || 0,
+          total: data.usage.total_tokens || 0,
         }
       : { prompt: 0, completion: 0, total: 0 };
 
     return { code: cleanedCode, tokens };
   } catch (err) {
-    console.error('Mistral API Call Failed:', err.message);
+    console.error('Groq API call failed:', err.message);
     throw err;
   }
 }

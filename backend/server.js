@@ -2,8 +2,8 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import { Mistral } from '@mistralai/mistralai';
 import dotenv from 'dotenv';
+import { buildAstGraph } from './astGraph.js';
 
 dotenv.config();
 
@@ -16,11 +16,59 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-const apiKey = process.env.MISTRAL_API_KEY;
-const mistralClient = apiKey ? new Mistral({ apiKey }) : null;
+const groqApiKey = process.env.GROQ_API_KEY;
+const groqModel = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 
 // Cache for rollback feature: key -> rawInput
 const originalCache = new Map();
+
+function parseJsonResponse(rawText) {
+  const text = String(rawText || '').trim();
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const payload = match ? match[1].trim() : text;
+  return JSON.parse(payload);
+}
+
+async function callGroq(fileName, detectedLang, rawInput) {
+  if (!groqApiKey) {
+    throw new Error('GROQ_API_KEY is not configured.');
+  }
+
+  const response = await fetch(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${groqApiKey}`
+      },
+      body: JSON.stringify({
+        model: groqModel,
+        messages: [
+          {
+            role: 'system',
+            content: `You are an expert ${detectedLang} developer. Fix the code/error provided. Return ONLY valid JSON with keys "patchedCode" (string) and "explanation" (string).`
+          },
+          {
+            role: 'user',
+            content: `File: ${fileName}\nLanguage: ${detectedLang}\nInput:\n${rawInput}`
+          }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.2
+      })
+    }
+  );
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error?.message || 'Groq API request failed.');
+  }
+
+  const text = data?.choices?.[0]?.message?.content || '';
+
+  return parseJsonResponse(text);
+}
 
 // Root route for Render health checks & quick verification
 app.get('/', (req, res) => {
@@ -48,6 +96,7 @@ app.post('/api/run-agent', async (req, res) => {
   try {
     const { 
       customCode = '', 
+      sourceCode = '',
       errorTrace = '', 
       prompt = '', 
       language = 'Auto', 
@@ -94,14 +143,8 @@ app.post('/api/run-agent', async (req, res) => {
     originalCache.set(fileName, rawInput);
     if (scenarioId) originalCache.set(scenarioId, rawInput);
 
-    // Dynamic Nodes Graph
+    const astGraph = buildAstGraph(sourceCode || customCode || rawInput, language, fileName);
     const rootNodeName = fileName.replace(/\.[^/.]+$/, "");
-    const nodes = [
-      { id: '1', label: `${rootNodeName} (Target)`, status: 'PATCHED', type: 'primary' },
-      { id: '2', label: `${rootNodeName}Service`, status: 'OK', type: 'dependency' },
-      { id: '3', label: 'Database', status: 'OK', type: 'store' },
-      { id: '4', label: 'AuthMiddleware', status: 'OK', type: 'middleware' }
-    ];
 
     // 2. Real-time Targeted Logs
     emitLog(socketId, { node: 1, text: `🔍 [Node 01] Triaging: Classifying error in ${detectedLang}...` });
@@ -109,46 +152,20 @@ app.post('/api/run-agent', async (req, res) => {
     emitLog(socketId, { node: 1, text: `✅ [Node 01] Triage complete. Language: ${detectedLang}, File: ${fileName}` });
 
     await sleep(300);
-    emitLog(socketId, { node: 2, text: `🕸️ [Node 02] AST Indexing: Building dependency graph for ${fileName}...` });
+    emitLog(socketId, { node: 2, text: `🕸️ [Node 02] Parsing source AST for ${fileName}...` });
     await sleep(400);
-    emitLog(socketId, { node: 2, text: `✅ [Node 02] AST indexed: ${rootNodeName}, ${rootNodeName}Service, Database` });
+    emitLog(socketId, {
+      node: 2,
+      text: astGraph.graphStatus === 'ready' || astGraph.graphStatus === 'partial'
+        ? `✅ [Node 02] AST indexed: ${astGraph.nodes.length} source nodes`
+        : `⚠️ [Node 02] AST unavailable: ${astGraph.graphMessage}`
+    });
 
-    emitLog(socketId, { node: 3, text: `🧠 [Node 03] Generating patch for ${detectedLang} via Mistral...` });
+    emitLog(socketId, { node: 3, text: `🧠 [Node 03] Generating patch for ${detectedLang} via Groq...` });
 
-    let patchedCode = '';
-    let explanation = '';
-
-    // Query Mistral API if configured
-    if (mistralClient) {
-      try {
-        const response = await mistralClient.chat.complete({
-          model: 'codestral-latest',
-          messages: [
-            {
-              role: 'system',
-              content: `You are an expert ${detectedLang} developer. Fix the code/error provided. Return ONLY valid JSON with keys "patchedCode" (string) and "explanation" (string).`
-            },
-            {
-              role: 'user',
-              content: `File: ${fileName}\nLanguage: ${detectedLang}\nInput:\n${rawInput}`
-            }
-          ],
-          responseFormat: { type: 'json_object' }
-        });
-
-        const parsed = JSON.parse(response.choices[0].message.content);
-        patchedCode = parsed.patchedCode;
-        explanation = parsed.explanation;
-      } catch (aiErr) {
-        console.error("Mistral API error, falling back to static patch:", aiErr);
-      }
-    }
-
-    // Static Fallback if API fails or key is missing
-    if (!patchedCode) {
-      patchedCode = `// ${fileName} - PATCHED by AI Agent\n// Safe defensive guard applied for ${detectedLang}\n\n${rawInput}`;
-      explanation = `Applied automated defensive guards for ${detectedLang}.`;
-    }
+    const parsed = await callGroq(fileName, detectedLang, rawInput);
+    const patchedCode = parsed.patchedCode;
+    const explanation = parsed.explanation;
 
     emitLog(socketId, { node: 3, text: `⚡ [Node 03] Patch generated successfully.` });
 
@@ -171,7 +188,9 @@ app.post('/api/run-agent', async (req, res) => {
       originalCode: rawInput,
       patchedCode,
       explanation,
-      nodes
+      nodes: astGraph.nodes,
+      graphStatus: astGraph.graphStatus,
+      graphMessage: astGraph.graphMessage,
     });
 
   } catch (err) {

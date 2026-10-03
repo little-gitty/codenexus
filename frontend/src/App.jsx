@@ -223,7 +223,9 @@ function Dashboard({ user, onSignOut }) {
       originalCode: inputSnippet,
       patchedCode: '// ⏳ AI Agent is generating patch...',
       explanation: 'Analyzing AST nodes and stack trace...',
-      nodes: []
+      nodes: [],
+      graphStatus: 'analyzing',
+      graphMessage: 'Parsing submitted source code...'
     });
 
     speak(`Initiating fix for ${scenario.shortLabel}`, muted);
@@ -241,6 +243,7 @@ function Dashboard({ user, onSignOut }) {
         body: JSON.stringify({
           scenarioId: scenario.id,
           customCode: finalCustomCode || null,
+          sourceCode: finalCustomCode || (promptText ? '' : scenario.brokenCode || ''),
           errorTrace: promptText || inputSnippet,
           language: finalLanguage,
           prompt: promptText || inputSnippet,
@@ -258,22 +261,15 @@ function Dashboard({ user, onSignOut }) {
       const data = await res.json();
 
       if (data.success) {
-        // Build live AST nodes from backend response
-        const liveNodes = data.nodes?.length
-          ? data.nodes
-          : [
-              { id: data.fileName?.replace(/\.[^/.]+$/, '') || 'Target', x: 250, y: 55,  broken: true,  deps: ['Service'] },
-              { id: 'Service',  x: 250, y: 170, broken: false, deps: ['Database'] },
-              { id: 'Database', x: 130, y: 285, broken: false, deps: [] },
-            ];
-
         setActiveRun({
           fileName:     data.fileName || optimisticFileName,
           language:     data.language || finalLanguage,
           originalCode: data.originalCode || inputSnippet,
           patchedCode:  data.patchedCode,
           explanation:  data.explanation || 'Patch generated successfully.',
-          nodes:        liveNodes,
+          nodes:        data.nodes || [],
+          graphStatus:  data.graphStatus,
+          graphMessage: data.graphMessage,
         });
 
         setShowDiff(true);

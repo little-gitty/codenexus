@@ -1,61 +1,88 @@
-import React, { useState, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Network, Zap, CheckCircle2 } from 'lucide-react';
+import { Network, Zap } from 'lucide-react';
 
-// ─── Fallback shape used only when backend returns no nodes ───────────────────
-const FALLBACK_NODES = [
-  { id: 'TargetFile',  x: 250, y: 55,  broken: true,  deps: ['Service'] },
-  { id: 'Service',     x: 250, y: 170, broken: false, deps: ['Database'] },
-  { id: 'Database',    x: 130, y: 285, broken: false, deps: [] },
-];
+const VIEW_WIDTH = 500;
+const VIEW_HEIGHT = 360;
 
-// ─── Map backend flat node list to SVG-positional format ─────────────────────
 function positionNodes(rawNodes = []) {
-  if (!rawNodes.length) return FALLBACK_NODES;
+  if (!rawNodes.length) return [];
+  if (rawNodes.every(node => Number.isFinite(node.x) && Number.isFinite(node.y))) return rawNodes;
 
-  // If the nodes already have x/y (from scenario astNodes), use them
-  if (rawNodes[0]?.x !== undefined) return rawNodes;
+  const nodeIds = new Set(rawNodes.map(node => node.id));
+  const dependedOn = new Set(rawNodes.flatMap(node => node.deps || []));
+  const roots = rawNodes.filter(node => !dependedOn.has(node.id));
+  const depths = new Map((roots.length ? roots : rawNodes.slice(0, 1)).map(node => [node.id, 0]));
+  const queue = [...depths.keys()];
 
-  // Map backend { id, label, status, type } format into positioned nodes
-  const typeToY = { primary: 55, dependency: 170, middleware: 170, store: 285 };
-  const xs = [130, 250, 370, 460];
-  let xIdx = 0;
-  return rawNodes.map((n, i) => ({
-    id: n.label || n.id || `Node${i}`,
-    x: xs[i % xs.length] || 250,
-    y: typeToY[n.type] || (55 + i * 115),
-    broken: n.status === 'PATCHED' || i === 0,   // first node is the patched target
-    deps: i < rawNodes.length - 1 ? [rawNodes[i + 1]?.label || rawNodes[i + 1]?.id] : [],
-  }));
+  while (queue.length) {
+    const id = queue.shift();
+    const depth = depths.get(id);
+    const node = rawNodes.find(item => item.id === id);
+    for (const dependency of node?.deps || []) {
+      if (nodeIds.has(dependency) && !depths.has(dependency)) {
+        depths.set(dependency, depth + 1);
+        queue.push(dependency);
+      }
+    }
+  }
+
+  const maxDepth = Math.max(0, ...depths.values());
+  for (const node of rawNodes) {
+    if (!depths.has(node.id)) depths.set(node.id, maxDepth + 1);
+  }
+
+  const layers = new Map();
+  for (const node of rawNodes) {
+    const depth = depths.get(node.id);
+    layers.set(depth, [...(layers.get(depth) || []), node]);
+  }
+
+  const finalDepth = Math.max(...layers.keys());
+  return rawNodes.map(node => {
+    const depth = depths.get(node.id);
+    const layer = layers.get(depth);
+    const index = layer.findIndex(item => item.id === node.id);
+    return {
+      ...node,
+      x: finalDepth === 0 ? VIEW_WIDTH / 2 : 42 + (depth / finalDepth) * (VIEW_WIDTH - 84),
+      y: (VIEW_HEIGHT / (layer.length + 1)) * (index + 1),
+    };
+  });
 }
 
 export default function AstMeshView({ scenario, activeNode, pipelineComplete, activeRun, compact = false }) {
   const [hoveredNode, setHoveredNode] = useState(null);
+  const [selectedNode, setSelectedNode] = useState(null);
 
-  // Priority: live backend nodes → scenario astNodes → fallback
-  const rawNodes = activeRun?.nodes?.length
-    ? activeRun.nodes
-    : scenario?.astNodes?.length
-    ? scenario.astNodes
-    : null;
+  const hasRunGraph = Boolean(activeRun && (activeRun.graphStatus || activeRun.nodes?.length));
+  const graphStatus = hasRunGraph ? activeRun.graphStatus || 'ready' : 'idle';
+  const runNodes = activeRun?.nodes;
 
-  const nodes = useMemo(() => positionNodes(rawNodes), [rawNodes]);
+  const nodes = useMemo(() => positionNodes(hasRunGraph ? runNodes || [] : []), [hasRunGraph, runNodes]);
 
-  const VW = 500;
-  const VH = 340;
-
-  const getX = (n) => (n.x / 500) * VW;
-  const getY = (n) => (n.y / 360) * VH;
+  const getX = (node) => node.x;
+  const getY = (node) => node.y;
 
   const getNodeColor = (n, idx) => {
-    if (pipelineComplete) return '#34d399';
-    // First node is the "broken/target" node being patched
-    if (n.broken || idx === 0) return activeNode >= 2 ? '#06b6d4' : '#f87171';
-    return activeNode >= 2 ? 'rgba(6,182,212,0.6)' : '#475569';
+    if (pipelineComplete && n.type === 'file') return '#34d399';
+    if (n.broken || n.type === 'file' || idx === 0) return activeNode >= 2 ? '#06b6d4' : '#f87171';
+    return ({
+      function: '#22d3ee',
+      import: '#fbbf24',
+      class: '#34d399',
+      variable: '#60a5fa',
+    })[n.type] || '#94a3b8';
   };
 
   const fileLabel = activeRun?.fileName || scenario?.filename || 'No file loaded';
   const nodeCount = nodes.length;
+  const inspectedNode = nodes.find(node => node.id === (selectedNode || hoveredNode));
+  const emptyMessage = graphStatus === 'analyzing'
+    ? activeRun?.graphMessage || 'Parsing submitted source code...'
+    : graphStatus === 'idle'
+    ? 'Run a patch with source code to build its AST.'
+    : activeRun?.graphMessage || 'No parseable source structures were found.';
 
   return (
     <div className={`flex flex-col h-full ${compact ? 'gap-2' : 'gap-4 pb-8'}`}>
@@ -69,20 +96,20 @@ export default function AstMeshView({ scenario, activeNode, pipelineComplete, ac
             </h2>
             <p className="text-[10px] font-mono text-slate-500 mt-0.5">
               {fileLabel} · {nodeCount} nodes indexed
-              {activeRun?.nodes?.length ? (
-                <span className="ml-2 text-cyan-500/60">● Live from backend</span>
+              {graphStatus === 'ready' || graphStatus === 'partial' ? (
+                <span className="ml-2 text-cyan-500/60">● Parsed from source</span>
               ) : (
-                <span className="ml-2 text-slate-700">● Fallback layout</span>
+                <span className="ml-2 text-slate-600">● {graphStatus === 'idle' ? 'Awaiting source' : graphStatus}</span>
               )}
             </p>
           </div>
           {/* Legend */}
           <div className="flex items-center gap-4">
             {[
-              { label: 'Broken',  color: 'bg-red-400' },
-              { label: 'Scanning', color: 'bg-cyan-400' },
-              { label: 'Patched', color: 'bg-emerald-400' },
-              { label: 'Clean',   color: 'bg-slate-600' },
+              { label: 'File', color: 'bg-red-400' },
+              { label: 'Function', color: 'bg-cyan-400' },
+              { label: 'Import', color: 'bg-amber-400' },
+              { label: 'Class / value', color: 'bg-emerald-400' },
             ].map(l => (
               <span key={l.label} className="flex items-center gap-1.5 text-[9px] font-mono text-slate-500">
                 <span className={`w-2 h-2 rounded-full ${l.color}`} />
@@ -103,7 +130,7 @@ export default function AstMeshView({ scenario, activeNode, pipelineComplete, ac
           }}
         />
 
-        <svg viewBox={`0 0 ${VW} ${VH}`} className="w-full h-full">
+        <svg viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`} className="w-full h-full">
           <defs>
             <filter id="nodeGlow">
               <feGaussianBlur stdDeviation="2.5" result="blur" />
@@ -123,13 +150,15 @@ export default function AstMeshView({ scenario, activeNode, pipelineComplete, ac
               const t = nodes.find((x) => x.id === depId);
               if (!t) return null;
               const active = activeNode >= 2;
+              const related = !selectedNode || selectedNode === n.id || selectedNode === depId;
               return (
                 <motion.line
                   key={`${n.id}-${depId}`}
                   x1={getX(n)} y1={getY(n)}
                   x2={getX(t)} y2={getY(t)}
-                  stroke={active ? 'rgba(6,182,212,0.45)' : 'rgba(51,65,85,0.4)'}
-                  strokeWidth="1.5"
+                  stroke={selectedNode && related ? '#67e8f9' : active ? 'rgba(6,182,212,0.45)' : 'rgba(51,65,85,0.4)'}
+                  strokeOpacity={related ? 1 : 0.15}
+                  strokeWidth={selectedNode && related ? '2.5' : '1.5'}
                   strokeDasharray={active && !pipelineComplete ? '5 3' : undefined}
                   markerEnd={active ? 'url(#arrowCyan)' : 'url(#arrowGray)'}
                   initial={{ pathLength: 0, opacity: 0 }}
@@ -145,15 +174,30 @@ export default function AstMeshView({ scenario, activeNode, pipelineComplete, ac
             const color = getNodeColor(n, idx);
             const cx = getX(n);
             const cy = getY(n);
-            const isTarget = n.broken || idx === 0;
-            const displayLabel = (n.id || '').length > 10 ? `${(n.id || '').slice(0, 9)}…` : (n.id || '');
+            const isTarget = n.type === 'file' || n.broken || idx === 0;
+            const label = n.label || n.id || '';
+            const displayLabel = label.length > 12 ? `${label.slice(0, 11)}…` : label;
+            const isSelected = selectedNode === n.id;
 
             return (
               <g
                 key={n.id || idx}
+                role="button"
+                tabIndex={0}
+                aria-label={`${n.type || 'AST node'}: ${label}`}
+                aria-pressed={isSelected}
                 onMouseEnter={() => setHoveredNode(n.id)}
                 onMouseLeave={() => setHoveredNode(null)}
-                className="cursor-pointer"
+                onFocus={() => setHoveredNode(n.id)}
+                onBlur={() => setHoveredNode(null)}
+                onClick={() => setSelectedNode(current => current === n.id ? null : n.id)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    setSelectedNode(current => current === n.id ? null : n.id);
+                  }
+                }}
+                className="cursor-pointer outline-none"
               >
                 {/* Pulse ring on broken/target node */}
                 {isTarget && !pipelineComplete && (
@@ -172,21 +216,14 @@ export default function AstMeshView({ scenario, activeNode, pipelineComplete, ac
                   transition={{ delay: idx * 0.08, duration: 0.3 }}
                 />
 
-                {/* Checkmark when complete */}
-                {pipelineComplete && isTarget && (
-                  <text x={cx} y={cy + 1} textAnchor="middle" dominantBaseline="central" fill="#34d399" fontSize="13">✓</text>
-                )}
-
                 {/* Node label */}
-                {!(pipelineComplete && isTarget) && (
-                  <text
-                    x={cx} y={cy}
-                    textAnchor="middle" dominantBaseline="central"
-                    fill={color} fontSize="7.5" fontFamily="monospace" fontWeight="600"
-                  >
-                    {displayLabel}
-                  </text>
-                )}
+                <text
+                  x={cx} y={cy}
+                  textAnchor="middle" dominantBaseline="central"
+                  fill={color} fontSize="7.5" fontFamily="monospace" fontWeight="600"
+                >
+                  {displayLabel}
+                </text>
               </g>
             );
           })}
@@ -194,45 +231,31 @@ export default function AstMeshView({ scenario, activeNode, pipelineComplete, ac
 
         {/* Hover tooltip */}
         <AnimatePresence>
-          {hoveredNode && (() => {
-            const n = nodes.find((x) => x.id === hoveredNode);
-            if (!n) return null;
-            return (
+          {inspectedNode && (
               <motion.div
-                key="tooltip"
+                key={inspectedNode.id}
                 initial={{ opacity: 0, scale: 0.9 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.9 }}
-                className="absolute top-2 right-2 bg-slate-900/95 border border-slate-700 p-2.5 rounded-lg text-[9px] font-mono text-slate-200 z-10 shadow-2xl"
+                className="absolute top-2 right-2 max-w-[210px] bg-slate-900/95 border border-slate-700 p-2.5 rounded-lg text-[9px] font-mono text-slate-200 z-10 shadow-2xl"
               >
-                <div className="font-bold text-[10px] text-slate-100 mb-1">{n.id}</div>
-                <div className={`flex items-center gap-1 ${
-                  pipelineComplete && (n.broken || nodes.indexOf(n) === 0)
-                    ? 'text-emerald-400'
-                    : (n.broken || nodes.indexOf(n) === 0)
-                    ? 'text-red-400'
-                    : 'text-slate-400'
-                }`}>
-                  {pipelineComplete && (n.broken || nodes.indexOf(n) === 0)
-                    ? <><CheckCircle2 className="w-2.5 h-2.5" /> PATCHED</>
-                    : (n.broken || nodes.indexOf(n) === 0)
-                    ? '● BROKEN / TARGET'
-                    : '● CLEAN'
-                  }
-                </div>
-                {n.deps?.length > 0 && (
-                  <div className="text-slate-600 mt-1">deps: {n.deps.join(', ')}</div>
-                )}
+                <div className="font-bold text-[10px] text-slate-100 mb-1 break-all">{inspectedNode.label || inspectedNode.id}</div>
+                <div className="text-cyan-300">{inspectedNode.type || 'AST node'}{inspectedNode.line ? ` · line ${inspectedNode.line}` : ''}</div>
+                <div className="text-slate-400 mt-1">{inspectedNode.detail}</div>
+                <div className="text-slate-300 mt-1">Depends on: {(inspectedNode.deps || []).map(id => nodes.find(node => node.id === id)?.label || id).join(', ') || 'none'}</div>
+                <div className="text-slate-500 mt-1">Used by: {nodes.filter(node => node.deps?.includes(inspectedNode.id)).map(node => node.label || node.id).join(', ') || 'none'}</div>
               </motion.div>
-            );
-          })()}
+          )}
         </AnimatePresence>
 
         {/* Empty state */}
-        {!activeRun?.nodes?.length && !scenario?.astNodes?.length && !pipelineComplete && (
-          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 text-[9px] font-mono text-slate-700 flex items-center gap-1.5">
-            <Zap className="w-3 h-3" /> Run a patch to generate live AST topology
+        {nodes.length === 0 && (
+          <div className="absolute inset-0 grid place-content-center px-5 text-center text-[10px] font-mono text-slate-500">
+            <span className="flex items-center justify-center gap-2"><Zap className="w-3 h-3 text-cyan-500" />{emptyMessage}</span>
           </div>
+        )}
+        {graphStatus === 'partial' && activeRun?.graphMessage && nodes.length > 0 && (
+          <div className="absolute bottom-2 left-2 text-[9px] font-mono text-amber-400">{activeRun.graphMessage}</div>
         )}
       </div>
     </div>
